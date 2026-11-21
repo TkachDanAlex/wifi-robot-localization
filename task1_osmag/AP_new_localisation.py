@@ -71,6 +71,9 @@ def run_ap(ap_positions, edges, polygons, clusters, test_data, rssi_0, n, wall, 
 
 
 def main():
+    out_dir = "AP_localisation"
+    os.makedirs(out_dir, exist_ok=True)
+
     cfg = ConfigurationManager("./config/ap_localization_config.yaml")
     loader = DataLoader(cfg)
     ap_to_pos, ap_level, target_ap, _, _, _, polygon_edges, ap_learn_flag = loader.load_osm_data()
@@ -103,8 +106,8 @@ def main():
     csv_rows = []
     fig, axes = plt.subplots(2, 3, figsize=(21, 11))
 
-    print(f"\n{'Набор':<18} | {'Режим':<28} | {'Mean (м)':<8} | {'Median (м)':<10} | {'RMSE (м)':<8} | {'95% (м)':<8} | {'Решений':<10}")
-    print("-" * 106)
+    print(f"\n{'Набор':<18} | {'Режим':<28} | {'Mean (м)':<8} | {'Median (м)':<10} | {'RMSE (м)':<8} | {'95% (м)':<8} | {'Решений':<12}")
+    print("-" * 108)
 
     for row_idx, (set_name, r0, n_val, w_val) in enumerate(param_sets):
         ax_hist, ax_map, ax_cdf = axes[row_idx]
@@ -156,7 +159,11 @@ def main():
                 for r in res.values()
             ]
             m = calc_metrics([x["err"] for x in recs], total_test)
-            csv_rows.append([set_name, mode_label, m["mean"], m["median"], m["rmse"], m["p95"], m["ok"], total_test, m["rate"]])
+            csv_rows.append([
+                set_name, mode_label,
+                round(m["mean"], 2), round(m["median"], 2), round(m["rmse"], 2), round(m["p95"], 2),
+                m["ok"], total_test, round(m["rate"], 1),
+            ])
             print(
                 f"{set_name:<18} | {mode_label:<28} | {m['mean']:<8.2f} | {m['median']:<10.2f} | "
                 f"{m['rmse']:<8.2f} | {m['p95']:<8.2f} | {m['ok']}/{total_test} ({m['rate']:.0f}%)"
@@ -179,7 +186,7 @@ def main():
             for x0, y0, x1, y1 in zip(tx, ty, px, py):
                 ax_map.plot([x0, x1], [y0, y1], color=color, linestyle="--", linewidth=0.85, alpha=0.6)
 
-            errs = np.sort([r["err"] for r in recs])
+            errs = np.sort([r["err"] for r in recs if r["err"] is not None and not np.isnan(r["err"])])
             if len(errs) > 0:
                 cdf = np.arange(1, len(errs) + 1) / len(errs)
                 ax_cdf.step(errs, cdf, where="post", color=color, linewidth=2, label=mode_label)
@@ -205,14 +212,17 @@ def main():
         ax_cdf.grid(True, linestyle="--", alpha=0.6)
         ax_cdf.legend(fontsize=8.5, loc="lower right")
 
-    with open("ap_train_vs_default.csv", "w", newline="", encoding="utf-8") as f:
+    csv_path = os.path.join(out_dir, "ap_train_vs_default.csv")
+    png_path = os.path.join(out_dir, "ap_train_vs_default.png")
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["param_set", "mode", "mean_m", "median_m", "rmse_m", "p95_m", "resolved", "total", "success_rate_pct"])
         writer.writerows(csv_rows)
 
     plt.tight_layout()
-    plt.savefig("ap_train_vs_default.png", dpi=200)
-    print("\nСохранено: ap_train_vs_default.png, ap_train_vs_default.csv")
+    plt.savefig(png_path, dpi=200)
+    print(f"\nСохранено в {out_dir}/: ap_train_vs_default.png, ap_train_vs_default.csv")
     plt.show()
 
 

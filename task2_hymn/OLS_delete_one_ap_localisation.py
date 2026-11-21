@@ -60,7 +60,7 @@ def build_ap_table(preds: np.ndarray, rx_xy: np.ndarray, zones: list, dropped_la
 
 
 def main():
-    out_dir = "OLS_localisation"
+    out_dir = "OLS_leave_one_ap_out"
     os.makedirs(out_dir, exist_ok=True)
 
     anchors = pd.read_csv(find_file("data/reference/csv/anchor_coordinates.csv", "anchor_coordinates.csv"))

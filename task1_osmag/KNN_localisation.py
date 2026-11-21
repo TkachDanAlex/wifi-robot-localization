@@ -9,24 +9,39 @@ from io_layer.osm_parser import OsmDataParser, WiFiFingerprintParser, WiFiTestPo
 from core.fingerprint_knn import WiFiKNNLocalizer
 
 
-def calc_metrics(errors):
-    arr = np.array(errors, dtype=float)
+def calc_metrics(errors, total_count):
+    valid = [float(e) for e in errors if e is not None and not np.isnan(e)]
+    if not valid:
+        return {"mean": np.nan, "median": np.nan, "rmse": np.nan, "p95": np.nan, "ok": 0, "rate": 0.0}
+    arr = np.array(valid, dtype=float)
     return {
         "mean": float(np.mean(arr)),
         "median": float(np.median(arr)),
         "rmse": float(np.sqrt(np.mean(arr ** 2))),
         "p95": float(np.percentile(arr, 95)),
+        "ok": len(arr),
+        "rate": float(len(arr) / total_count * 100.0),
     }
 
 
+def extract_unconstrained_error(rec):
+    if "error_unconstrained" in rec and rec["error_unconstrained"] is not None:
+        return rec["error_unconstrained"]
+    return rec.get("error_constrained")
+
+
 def main():
+    out_dir = "KNN_localisation"
+    os.makedirs(out_dir, exist_ok=True)
+
     fp_parser = WiFiFingerprintParser("./map/wifi_data.osm")
     fingerprint_data = fp_parser.parse_fingerprint_data()
 
     tp_parser = WiFiTestPointParser("./map/Non-FingerprintedAreas.osm")
     test_points = tp_parser.parse_test_points()
+    total_test = len(test_points)
 
-    localizer = WiFiKNNLocalizer(
+    localizer_const = WiFiKNNLocalizer(
         fingerprint_data=fingerprint_data,
         all_macs=fp_parser.all_macs,
         k=5,
@@ -34,8 +49,16 @@ def main():
         use_boundary_constraint=True,
     )
 
-    max_k = min(100, len(localizer.feature_matrix))
-    print(f"Точек в базе: {len(localizer.feature_matrix)}, диапазон k: 1..{max_k}")
+    localizer_unconst = WiFiKNNLocalizer(
+        fingerprint_data=fingerprint_data,
+        all_macs=fp_parser.all_macs,
+        k=5,
+        polygon_file=None,
+        use_boundary_constraint=False,
+    )
+
+    max_k = min(100, len(localizer_const.feature_matrix))
+    print(f"Точек в базе: {len(localizer_const.feature_matrix)}, тестовых точек: {total_test}, диапазон k: 1..{max_k}")
 
     metrics_list = [
         ("euclidean", "L2 (евклидова)"),
@@ -59,7 +82,8 @@ def main():
                 "median": [],
                 "rmse": [],
                 "p95": [],
-                "best_res": None,
+                "best_res_const": None,
+                "best_res_unconst": None,
                 "best_k": None,
                 "best_mean": np.inf,
             }
@@ -70,44 +94,71 @@ def main():
         for w_key, _ in weights_list:
             v = variants[(m_key, w_key)]
             for k in range(1, max_k + 1):
-                localizer.k = k
-                localizer.knn_model = KNeighborsRegressor(
-                    n_neighbors=k,
-                    weights=w_key,
-                    metric=m_key,
-                )
-                localizer.knn_model.fit(localizer.feature_matrix, localizer.position_matrix)
+                localizer_const.k = k
+                localizer_const.knn_model = KNeighborsRegressor(n_neighbors=k, weights=w_key, metric=m_key)
+                localizer_const.knn_model.fit(localizer_const.feature_matrix, localizer_const.position_matrix)
 
-                results = localizer.localize(test_points)
-                errs = [r["error_constrained"] for r in results.values()]
-                m = calc_metrics(errs)
+                res_c = localizer_const.localize(test_points)
+                errs_c = [r.get("error_constrained") for r in res_c.values()]
+                m_c = calc_metrics(errs_c, total_test)
 
                 v["ks"].append(k)
-                v["mean"].append(m["mean"])
-                v["median"].append(m["median"])
-                v["rmse"].append(m["rmse"])
-                v["p95"].append(m["p95"])
+                v["mean"].append(m_c["mean"])
+                v["median"].append(m_c["median"])
+                v["rmse"].append(m_c["rmse"])
+                v["p95"].append(m_c["p95"])
 
-                if m["mean"] < v["best_mean"]:
-                    v["best_mean"] = m["mean"]
+                if m_c["mean"] < v["best_mean"]:
+                    v["best_mean"] = m_c["mean"]
                     v["best_k"] = k
-                    v["best_res"] = results
+                    v["best_res_const"] = res_c
 
-                csv_rows.append([m_key, w_key, k, m["mean"], m["median"], m["rmse"], m["p95"]])
+                csv_rows.append([
+                    m_key, w_key, "with_constraints", k,
+                    round(m_c["mean"], 2), round(m_c["median"], 2), round(m_c["rmse"], 2), round(m_c["p95"], 2),
+                    m_c["ok"], total_test, round(m_c["rate"], 1),
+                ])
 
-    with open("knn_all_metrics.csv", "w", newline="", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, "knn_all_metrics.csv"), "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["metric", "weights", "k", "mean_m", "median_m", "rmse_m", "p95_m"])
+        writer.writerow(["metric", "weights", "mode", "k", "mean_m", "median_m", "rmse_m", "p95_m", "resolved", "total", "success_rate_pct"])
         writer.writerows(csv_rows)
 
-    print(f"\n{'Вариант':<32} | {'Best k':<6} | {'Mean (м)':<8} | {'RMSE (м)':<8} | {'95% (м)':<8}")
-    print("-" * 74)
-    for v in variants.values():
-        best_idx = int(np.nanargmin(v["mean"]))
-        print(
-            f"{v['title']:<32} | {v['ks'][best_idx]:<6} | "
-            f"{v['mean'][best_idx]:<8.2f} | {v['rmse'][best_idx]:<8.2f} | {v['p95'][best_idx]:<8.2f}"
-        )
+    comp_rows = []
+    print(f"\n{'Вариант':<30} | {'Best k':<6} | {'Режим':<18} | {'Mean (м)':<8} | {'Median (м)':<10} | {'RMSE (м)':<8} | {'95% (м)':<8} | {'Решений':<12}")
+    print("-" * 118)
+
+    for (m_key, w_key), v in variants.items():
+        best_k = v["best_k"]
+
+        localizer_unconst.k = best_k
+        localizer_unconst.knn_model = KNeighborsRegressor(n_neighbors=best_k, weights=w_key, metric=m_key)
+        localizer_unconst.knn_model.fit(localizer_unconst.feature_matrix, localizer_unconst.position_matrix)
+        res_u = localizer_unconst.localize(test_points)
+        v["best_res_unconst"] = res_u
+
+        errs_c = [r.get("error_constrained") for r in v["best_res_const"].values()]
+        errs_u = [extract_unconstrained_error(r) for r in res_u.values()]
+
+        m_c = calc_metrics(errs_c, total_test)
+        m_u = calc_metrics(errs_u, total_test)
+
+        for mode_name, m_obj in [("с ограничениями", m_c), ("без ограничений", m_u)]:
+            print(
+                f"{v['title']:<30} | {best_k:<6} | {mode_name:<18} | {m_obj['mean']:<8.2f} | "
+                f"{m_obj['median']:<10.2f} | {m_obj['rmse']:<8.2f} | {m_obj['p95']:<8.2f} | "
+                f"{m_obj['ok']}/{total_test} ({m_obj['rate']:.0f}%)"
+            )
+            comp_rows.append([
+                v["title"], best_k, mode_name,
+                round(m_obj["mean"], 2), round(m_obj["median"], 2), round(m_obj["rmse"], 2), round(m_obj["p95"], 2),
+                m_obj["ok"], total_test, round(m_obj["rate"], 1),
+            ])
+
+    with open(os.path.join(out_dir, "knn_constraints_comparison.csv"), "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["variant", "best_k", "mode", "mean_m", "median_m", "rmse_m", "p95_m", "resolved", "total", "success_rate_pct"])
+        writer.writerows(comp_rows)
 
     fig, axes = plt.subplots(5, 2, figsize=(15, 19), sharey=True)
     axes = axes.flatten()
@@ -131,7 +182,34 @@ def main():
         ax.legend(loc="upper right", fontsize=8)
 
     plt.tight_layout()
-    plt.savefig("knn_all_metrics.png", dpi=200)
+    plt.savefig(os.path.join(out_dir, "knn_all_metrics.png"), dpi=200)
+
+    fig_cdf, ax_cdf = plt.subplots(figsize=(9.5, 5.5))
+    cdf_specs = [
+        (("correlation", "distance"), "best_res_const", "error_constrained", "tab:blue", "-", "Корреляционная (1/d, с границами)"),
+        (("correlation", "distance"), "best_res_unconst", "unconstrained", "tab:red", "--", "Корреляционная (1/d, без границ)"),
+        (("euclidean", "distance"), "best_res_const", "error_constrained", "tab:orange", "-", "L2 евклидова (1/d, с границами)"),
+        (("euclidean", "distance"), "best_res_unconst", "unconstrained", "tab:purple", "--", "L2 евклидова (1/d, без границ)"),
+    ]
+    for key, res_field, err_mode, color, ls, label_prefix in cdf_specs:
+        v = variants[key]
+        res = v[res_field]
+        if err_mode == "unconstrained":
+            errs = np.sort([extract_unconstrained_error(r) for r in res.values() if extract_unconstrained_error(r) is not None])
+        else:
+            errs = np.sort([r[err_mode] for r in res.values() if r.get(err_mode) is not None])
+        if len(errs) > 0:
+            cdf = np.arange(1, len(errs) + 1) / len(errs)
+            ax_cdf.step(errs, cdf, where="post", color=color, linestyle=ls, linewidth=2.0, label=f"{label_prefix}, k={v['best_k']}")
+
+    ax_cdf.axhline(0.95, color="gray", linestyle=":", linewidth=1.1, label="Порог 95%")
+    ax_cdf.set_title("k-NN: сравнение с пространственными ограничениями и без них (CDF)")
+    ax_cdf.set_xlabel("Ошибка (м)")
+    ax_cdf.set_ylabel("Доля тестовых точек")
+    ax_cdf.grid(True, linestyle="--", alpha=0.6)
+    ax_cdf.legend(loc="lower right", fontsize=8.5)
+    fig_cdf.tight_layout()
+    fig_cdf.savefig(os.path.join(out_dir, "knn_constraints_cdf.png"), dpi=200)
 
     map_file = "./map/base_map.osm" if os.path.exists("./map/base_map.osm") else "./map/wifi_data.osm"
     poly_parser = OsmDataParser(map_file)
@@ -147,7 +225,7 @@ def main():
             x, y = poly.exterior.xy
             ax_map.plot(x, y, color="gray", alpha=0.5, linewidth=1.0, zorder=1)
 
-    train_pos = localizer.position_matrix
+    train_pos = localizer_const.position_matrix
     ax_map.scatter(
         train_pos[:, 0],
         train_pos[:, 1],
@@ -170,7 +248,7 @@ def main():
 
     for key, pos_field, marker, color, label_prefix in map_variants:
         v = variants[key]
-        res = v["best_res"]
+        res = v["best_res_const"]
         if not res:
             continue
 
@@ -224,12 +302,11 @@ def main():
     ax_map.legend(fontsize=8.5, loc="best")
 
     fig_map.tight_layout()
-    fig_map.savefig("knn_map_positions.png", dpi=200)
+    fig_map.savefig(os.path.join(out_dir, "knn_map_positions.png"), dpi=200)
 
-    print("\nСохранено: knn_all_metrics.png, knn_map_positions.png, knn_all_metrics.csv")
+    print(f"\nСохранено в {out_dir}/: knn_all_metrics.png, knn_constraints_cdf.png, knn_map_positions.png, knn_all_metrics.csv, knn_constraints_comparison.csv")
     plt.show()
 
 
 if __name__ == "__main__":
     main()
-    
